@@ -63,6 +63,9 @@
 #include <UE4SSRuntime.hpp>
 #include <Unreal/UnrealInitializer.hpp>
 
+#include <cstdint>
+#include <cstring>
+
 #if PLATFORM_WINDOWS
 #include <Unreal/Core/Windows/AllowWindowsPlatformTypes.hpp>
 #endif
@@ -97,6 +100,68 @@ namespace RC
             return function_full_name;
         }
     }
+
+
+
+
+    static void* find_static_load_object_internal()
+    {
+        HMODULE game_module = GetModuleHandle(nullptr);
+        if (!game_module) { return nullptr; }
+
+        auto* dos_header = reinterpret_cast<IMAGE_DOS_HEADER*>(game_module);
+        auto* nt_headers = reinterpret_cast<IMAGE_NT_HEADERS*>(
+            reinterpret_cast<uint8_t*>(game_module) + dos_header->e_lfanew);
+        uint8_t* module_base = reinterpret_cast<uint8_t*>(game_module);
+        size_t module_size = nt_headers->OptionalHeader.SizeOfImage;
+
+        static const wchar_t* target_str = L"Return an object still needing load from StaticLoadObjectInternal %s";
+        size_t target_len_bytes = wcslen(target_str) * sizeof(wchar_t);
+
+        uint8_t* string_addr = nullptr;
+        for (uint8_t* p = module_base; p < module_base + module_size - target_len_bytes; ++p)
+        {
+            if (memcmp(p, target_str, target_len_bytes) == 0) { string_addr = p; break; }
+        }
+        if (!string_addr) { return nullptr; }
+
+        uint8_t* indirect_ptr_addr = nullptr;
+        {
+            uint64_t needle = reinterpret_cast<uint64_t>(string_addr);
+            for (uint8_t* p = module_base; p < module_base + module_size - sizeof(uint64_t); ++p)
+            {
+                if (*reinterpret_cast<uint64_t*>(p) == needle) { indirect_ptr_addr = p; break; }
+            }
+        }
+
+        auto scan_for_rip_refs = [&](uint8_t* target) -> uint8_t* {
+            for (uint8_t* p = module_base; p < module_base + module_size - 7; ++p)
+            {
+                if ((p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 0x05)
+                {
+                    int32_t disp = *reinterpret_cast<int32_t*>(p + 3);
+                    if (p + 7 + disp == target) { return p; }
+                }
+            }
+            return nullptr;
+        };
+
+        uint8_t* xref = scan_for_rip_refs(string_addr);
+        if (!xref && indirect_ptr_addr) { xref = scan_for_rip_refs(indirect_ptr_addr); }
+        if (!xref) { return nullptr; }
+
+        DWORD64 image_base = 0;
+        auto* runtime_func = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(xref), &image_base, nullptr);
+        if (!runtime_func) { return nullptr; }
+
+        return reinterpret_cast<void*>(image_base + runtime_func->BeginAddress);
+    }
+
+    using StaticLoadObjectInternalFunc = Unreal::UObject*(*)(
+        Unreal::UClass*, Unreal::UObject*, const wchar_t*, const wchar_t*,
+        uint32_t, void*, bool, const void*);
+
+    static StaticLoadObjectInternalFunc g_static_load_object_internal = nullptr;
 
     struct LuaUnrealScriptFunctionData
     {
@@ -3322,52 +3387,95 @@ Overloads:
         });
 
         lua.register_function("LoadAsset", [](const LuaMadeSimple::Lua& lua) -> int {
-            std::string error_overload_not_found{R"(
+    std::string error_overload_not_found{R"(
 No overload found for function 'LoadAsset'.
 Overloads:
 #1: LoadAsset(string AssetPathAndName))"};
 
-            if (!Unreal::IsInGameThread())
-            {
-                throw std::runtime_error{"Function 'LoadAsset' can only be called from within the game thread"};
-            }
+    if (!Unreal::IsInGameThread())
+    {
+        throw std::runtime_error{"Function 'LoadAsset' can only be called from within the game thread"};
+    }
 
-            if (!lua.is_string())
-            {
-                throw std::runtime_error{error_overload_not_found};
-            }
-            auto asset_path_and_name = Unreal::FName(ensure_str(lua.get_string()), Unreal::FNAME_Add);
+    if (!lua.is_string())
+    {
+        throw std::runtime_error{error_overload_not_found};
+    }
 
-            auto* asset_registry = static_cast<Unreal::UAssetRegistry*>(Unreal::UAssetRegistryHelpers::GetAssetRegistry().ObjectPointer);
-            if (!asset_registry)
-            {
-                throw std::runtime_error{"Did not load assets because asset_registry was nullptr\n"};
-            }
+    auto asset_path_string = lua.get_string();
+    auto asset_path_and_name = Unreal::FName(ensure_str(asset_path_string), Unreal::FNAME_Add);
 
-            Unreal::UObject* loaded_asset{};
-            bool was_asset_found{};
-            bool did_asset_load{};
-            Unreal::FAssetData asset_data = asset_registry->GetAssetByObjectPath(asset_path_and_name);
-            if ((Unreal::Version::IsAtMost(5, 0) && asset_data.ObjectPath().GetComparisonIndex()) || asset_data.PackageName().GetComparisonIndex())
-            {
-                was_asset_found = true;
-                loaded_asset = Unreal::UAssetRegistryHelpers::GetAsset(asset_data);
-                if (loaded_asset)
-                {
-                    did_asset_load = true;
-                    Output::send(STR("Asset loaded\n"));
-                }
-                else
-                {
-                    Output::send(STR("Asset was found but not loaded, could be a package\n"));
-                }
-            }
+    auto* asset_registry = static_cast<Unreal::UAssetRegistry*>(Unreal::UAssetRegistryHelpers::GetAssetRegistry().ObjectPointer);
+    if (!asset_registry)
+    {
+        throw std::runtime_error{"Did not load assets because asset_registry was nullptr\n"};
+    }
 
-            LuaType::auto_construct_object(lua, loaded_asset);
-            lua.set_bool(was_asset_found);
-            lua.set_bool(did_asset_load);
-            return 3;
-        });
+    Unreal::UObject* loaded_asset{};
+    bool was_asset_found{};
+    bool did_asset_load{};
+    Unreal::FAssetData asset_data = asset_registry->GetAssetByObjectPath(asset_path_and_name);
+    if ((Unreal::Version::IsAtMost(5, 0) && asset_data.ObjectPath().GetComparisonIndex()) || asset_data.PackageName().GetComparisonIndex())
+    {
+        was_asset_found = true;
+        loaded_asset = Unreal::UAssetRegistryHelpers::GetAsset(asset_data);
+        if (loaded_asset)
+        {
+            did_asset_load = true;
+            Output::send(STR("Asset loaded\n"));
+        }
+        else
+        {
+            Output::send(STR("Asset was found but not loaded, could be a package\n"));
+        }
+    }
+
+    // raw engine load.
+    if (!was_asset_found)
+    {
+        Output::send(STR("Asset not in registry, attempting StaticLoadObjectInternal fallback\n"));
+
+        auto object_path_str = ensure_str(asset_path_string);
+        if (!g_static_load_object_internal)
+        {
+            g_static_load_object_internal = reinterpret_cast<StaticLoadObjectInternalFunc>(find_static_load_object_internal());
+        }
+
+        if (g_static_load_object_internal)
+        {
+            loaded_asset = reinterpret_cast<Unreal::UObject*>(g_static_load_object_internal(
+                reinterpret_cast<Unreal::UClass*>(Unreal::UObject::StaticClass()),
+                nullptr,
+                object_path_str.c_str(),
+                nullptr,
+                0,
+                nullptr,
+                true,
+                nullptr
+            ));
+        }
+        else
+        {
+            Output::send(STR("Could not locate StaticLoadObjectInternal in memory\n"));
+        }
+
+        if (loaded_asset)
+        {
+            was_asset_found = true;
+            did_asset_load = true;
+            Output::send(STR("Asset loaded via StaticLoadObjectInternal fallback\n"));
+        }
+        else
+        {
+            Output::send(STR("StaticLoadObjectInternal fallback also failed\n"));
+        }
+    }
+
+    LuaType::auto_construct_object(lua, loaded_asset);
+    lua.set_bool(was_asset_found);
+    lua.set_bool(did_asset_load);
+    return 3;
+});
 
         lua.register_function("FindObject", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
